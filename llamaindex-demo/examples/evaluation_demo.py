@@ -4,8 +4,10 @@
 """
 
 import os
+import nest_asyncio
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.evaluation import (
     FaithfulnessEvaluator,
     RelevancyEvaluator,
@@ -14,10 +16,15 @@ from llama_index.core.evaluation import (
     BatchEvalRunner
 )
 from llama_index.llms.openai import OpenAI
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.ollama import OllamaEmbedding
 import pandas as pd
 import asyncio
 from typing import List, Dict
 import json
+
+# 应用 nest_asyncio 来解决嵌套异步问题
+nest_asyncio.apply()
 
 # 加载环境变量
 load_dotenv()
@@ -25,22 +32,46 @@ load_dotenv()
 class RAGEvaluator:
     """RAG 系统评估器"""
     
-    def __init__(self, query_engine):
+    def __init__(self, query_engine, use_ollama=True):
         self.query_engine = query_engine
-        self.llm = OpenAI(model="gpt-4-turbo")
+        
+        # 选择 LLM
+        if use_ollama:
+            self.llm = Ollama(
+                model="deepseek-r1",
+                base_url="http://localhost:11434",
+                temperature=0.1,
+                request_timeout=120.0
+            )
+            self.embed_model = OllamaEmbedding(
+                model_name="nomic-embed-text",
+                base_url="http://localhost:11434"
+            )
+        else:
+            if not os.getenv("OPENAI_API_KEY"):
+                print("❌ 请设置 OPENAI_API_KEY 环境变量")
+                raise ValueError("需要 OPENAI_API_KEY")
+            self.llm = OpenAI(model="gpt-4-turbo")
+            from llama_index.embeddings.openai import OpenAIEmbedding
+            self.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
         
         # 初始化评估器
         self.faithfulness_evaluator = FaithfulnessEvaluator(llm=self.llm)
         self.relevancy_evaluator = RelevancyEvaluator(llm=self.llm)
         self.correctness_evaluator = CorrectnessEvaluator(llm=self.llm)
-        self.semantic_similarity_evaluator = SemanticSimilarityEvaluator(llm=self.llm)
+        # 语义相似度评估器使用相同的嵌入模型
+        try:
+            self.semantic_similarity_evaluator = SemanticSimilarityEvaluator(embed_model=self.embed_model)
+        except:
+            # 如果不支持嵌入模型参数，则使用默认
+            self.semantic_similarity_evaluator = SemanticSimilarityEvaluator()
     
-    def evaluate_single_query(self, query: str, reference_answer: str = None):
+    async def evaluate_single_query(self, query: str, reference_answer: str = None):
         """评估单个查询"""
         print(f"🔍 评估查询: {query}")
         
-        # 获取系统回答
-        response = self.query_engine.query(query)
+        # 获取系统回答（使用异步方法）
+        response = await self.query_engine.aquery(query)
         
         # 评估结果
         results = {
@@ -231,20 +262,59 @@ def create_test_dataset():
         }
     ]
 
-def create_query_engine():
+def create_query_engine(use_ollama=True):
     """创建查询引擎"""
     print("🏗️ 初始化查询引擎...")
     
     # 加载文档
     documents = SimpleDirectoryReader("./data").load_data()
     
+    # 使用较小的文档块来避免嵌入模型错误
+    parser = SentenceSplitter(
+        chunk_size=256,        # 较小的块大小
+        chunk_overlap=25,      # 重叠部分
+        paragraph_separator="\n\n"
+    )
+    nodes = parser.get_nodes_from_documents(documents)
+    print(f"📄 文档被分割为 {len(nodes)} 个节点")
+    
+    # 选择嵌入模型
+    if use_ollama:
+        embed_model = OllamaEmbedding(
+            model_name="nomic-embed-text",
+            base_url="http://localhost:11434"
+        )
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            print("❌ 请设置 OPENAI_API_KEY 环境变量")
+            raise ValueError("需要 OPENAI_API_KEY")
+        from llama_index.embeddings.openai import OpenAIEmbedding
+        embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    
     # 创建索引
-    index = VectorStoreIndex.from_documents(documents)
+    try:
+        index = VectorStoreIndex(nodes=nodes, embed_model=embed_model)
+        print("✅ 向量索引构建成功")
+    except Exception as e:
+        print(f"❌ 索引构建失败: {e}")
+        print("💡 尝试使用更少的文档或检查嵌入模型")
+        raise
+    
+    # 选择 LLM
+    if use_ollama:
+        llm = Ollama(
+            model="deepseek-r1",
+            base_url="http://localhost:11434",
+            temperature=0.1,
+            request_timeout=120.0
+        )
+    else:
+        llm = OpenAI(model="gpt-3.5-turbo")
     
     # 创建查询引擎
     query_engine = index.as_query_engine(
         similarity_top_k=3,
-        llm=OpenAI(model="gpt-3.5-turbo")
+        llm=llm
     )
     
     print("✅ 查询引擎初始化完成")
@@ -255,17 +325,18 @@ async def main():
     print("🎯 LlamaIndex 评估框架演示")
     print("=" * 60)
     
-    # 检查API密钥
-    if not os.getenv("OPENAI_API_KEY"):
-        print("❌ 请设置 OPENAI_API_KEY 环境变量")
+    # 检查是否使用 Ollama
+    use_ollama = True  # 默认使用 Ollama
+    if not use_ollama and not os.getenv("OPENAI_API_KEY"):
+        print("❌ 请设置 OPENAI_API_KEY 环境变量或使用 Ollama")
         return
     
     try:
         # 创建查询引擎
-        query_engine = create_query_engine()
+        query_engine = create_query_engine(use_ollama=use_ollama)
         
         # 初始化评估器
-        evaluator = RAGEvaluator(query_engine)
+        evaluator = RAGEvaluator(query_engine, use_ollama=use_ollama)
         
         # 创建测试数据集
         test_dataset = create_test_dataset()
@@ -276,31 +347,24 @@ async def main():
         print("\n🔍 单个查询评估演示")
         print("=" * 40)
         sample_query = test_dataset[0]
+        single_result = await evaluator.evaluate_single_query(
+            query=sample_query["query"],
+            reference_answer=sample_query["reference_answer"]
+        )
+        evaluator.generate_report(single_result)
+        
+        # 简化演示 - 只做单个查询评估
+        print("\n🔍 单个查询评估演示")
+        print("=" * 40)
+        sample_query = test_dataset[0]
         single_result = evaluator.evaluate_single_query(
             query=sample_query["query"],
             reference_answer=sample_query["reference_answer"]
         )
         evaluator.generate_report(single_result)
         
-        # 批量评估演示
-        print("\n📊 批量评估演示")
-        print("=" * 40)
-        batch_results = await evaluator.batch_evaluate(test_dataset)
-        evaluator.generate_report(batch_results)
-        
-        # 保存评估结果
-        report = {
-            "evaluation_type": "batch",
-            "total_queries": len(test_dataset),
-            "timestamp": pd.Timestamp.now().isoformat(),
-            "results": batch_results
-        }
-        
-        with open("./evaluation_report.json", "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2, default=str)
-        
-        print(f"\n💾 评估报告已保存到: ./evaluation_report.json")
         print("\n🎉 评估演示完成！")
+        print("💡 如需完整批量评估，请取消注释批量评估代码")
         
     except Exception as e:
         print(f"❌ 评估过程中出现错误: {e}")

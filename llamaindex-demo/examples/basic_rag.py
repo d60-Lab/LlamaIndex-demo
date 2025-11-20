@@ -4,17 +4,32 @@
 """
 
 import os
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.llms.openai import OpenAI
+
+# 添加 src 目录到路径
+sys.path.append(str(Path(__file__).parent.parent / "src"))
+from llm_factory import LLMFactory
 
 # 加载环境变量
 load_dotenv()
 
 def main():
     """基础 RAG 应用主函数"""
+    
+    # 检查 LLM 配置
+    try:
+        llm = LLMFactory.get_llm()
+        embed_model = LLMFactory.get_embedding_model()
+        print(f"🤖 使用 LLM: {llm.model}")
+        print(f"🔤 使用嵌入模型: {embed_model.model_name}")
+    except Exception as e:
+        print(f"❌ LLM 配置错误: {e}")
+        print("💡 请检查 .env 文件中的 API 密钥配置")
+        return
     
     # 1. 数据加载
     print("📁 加载文档数据...")
@@ -35,7 +50,7 @@ def main():
     print("🏗️ 构建向量索引...")
     index = VectorStoreIndex(
         nodes=nodes,
-        embed_model=OpenAIEmbedding(model="text-embedding-3-small")
+        embed_model=embed_model
     )
     print("✅ 索引构建完成")
     
@@ -44,7 +59,7 @@ def main():
     query_engine = index.as_query_engine(
         similarity_top_k=3,
         response_mode="compact",
-        llm=OpenAI(model="gpt-3.5-turbo"),
+        llm=llm,
     )
     
     # 5. 交互查询
